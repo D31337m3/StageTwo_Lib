@@ -9,6 +9,15 @@ import displayio
 import terminalio
 import adafruit_display_text.label
 from adafruit_display_shapes.rect import Rect
+try:
+    import adafruit_ble
+    from adafruit_ble import BLERadio
+    from adafruit_ble.services.standard.hid import HIDService
+    from adafruit_hid.keyboard import Keyboard
+    from adafruit_hid.keycode import Keycode
+    from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
+except ImportError:
+    adafruit_ble = None  # BLE not available
 
 class CommandTerminal:
     """
@@ -25,6 +34,20 @@ class CommandTerminal:
         """
         self.connection_type = connection_type
         self.display = display
+        self.prompt_visible = True
+        self.prompt_color = 0xFF69B4  # Pink
+        self.prompt_last_toggle = time.monotonic()
+        self.prompt_flash_interval = 0.5  # seconds
+        # BLE HID setup
+        if self.connection_type == "hid" and adafruit_ble:
+            self.ble = BLERadio()
+            self.hid_service = HIDService()
+            self.ble.start_advertising(ProvideServicesAdvertisement(self.hid_service))
+            self.keyboard = Keyboard(self.hid_service.devices)
+        else:
+            self.ble = None
+            self.hid_service = None
+            self.keyboard = None
         self.prompt = "> "
         self.history = []
         self.history_index = 0
@@ -65,16 +88,70 @@ CircuitPython Command Terminal
 Type 'help' for available commands
 Connected via: {self.connection_type}
 """
+    def _keycode_to_char(self, keycode):
+        """Convert a Keycode to a character (simple version)"""
+        # You may want to expand this for full keycode support
+        if keycode == Keycode.ENTER:
+            return '\n'
+        elif keycode == Keycode.BACKSPACE:
+            return '\x08'
+        elif Keycode.A <= keycode <= Keycode.Z:
+            return chr(keycode - Keycode.A + ord('a'))
+        elif Keycode.ZERO <= keycode <= Keycode.NINE:
+            return chr(keycode - Keycode.ZERO + ord('0'))
+        # Add more keycode mappings as needed
+        return ''
+    
+    def input(self):
+        """Get input from the appropriate source"""
+        if self.connection_type == "ssh" and self.channel:
+            # ...existing SSH input code...
+            return line
+        elif self.connection_type == "hid" and self.ble:
+            # BLE HID input
+            line = ""
+            self.output("", end="")  # Ensure prompt is shown
+            while True:
+                # Wait for a BLE connection
+                if not self.ble.connected:
+                    self.output("\nWaiting for BLE HID connection...")
+                    while not self.ble.connected:
+                        time.sleep(0.1)
+                    self.output("BLE HID connected!\n")
+                # Read key events
+                key_events = self.keyboard.get_key_presses()
+                for event in key_events:
+                    if event.pressed:
+                        char = self._keycode_to_char(event.keycode)
+                        if char == '\r' or char == '\n':
+                            self.output('\r\n', end="")
+                            return line
+                        elif char == '\x03':  # Ctrl+C
+                            self.output('^C\r\n', end="")
+                            return ""
+                        elif char == '\x04':  # Ctrl+D
+                            return "__EXIT__"
+                        elif char == '\x7f' or char == '\x08':  # Backspace
+                            if line:
+                                line = line[:-1]
+                                self.output('\b \b', end="")
+                        else:
+                            line += char
+                            self.output(char, end="")
+                time.sleep(0.01)
+        else:
+            # Get input from serial console
+            return input()
     
     def setup_display(self):
         """Setup the display for terminal output"""
         self.display_group = displayio.Group()
         self.display.show(self.display_group)
-        
+
         # Background
         bg = Rect(0, 0, self.display.width, self.display.height, fill=0x000000)
         self.display_group.append(bg)
-        
+
         # Terminal title
         title = adafruit_display_text.label.Label(
             terminalio.FONT,
@@ -84,7 +161,7 @@ Connected via: {self.connection_type}
             y=10
         )
         self.display_group.append(title)
-        
+
         # Last command display
         self.cmd_display = adafruit_display_text.label.Label(
             terminalio.FONT,
@@ -94,7 +171,7 @@ Connected via: {self.connection_type}
             y=30
         )
         self.display_group.append(self.cmd_display)
-        
+
         # Output display
         self.output_display = adafruit_display_text.label.Label(
             terminalio.FONT,
@@ -104,6 +181,29 @@ Connected via: {self.connection_type}
             y=50
         )
         self.display_group.append(self.output_display)
+
+        # Prompt display (add this)
+        self.prompt_display = adafruit_display_text.label.Label(
+            terminalio.FONT,
+            text=self.prompt,
+            color=self.prompt_color,
+            x=5,
+            y=self.display.height - 20
+        )
+        self.display_group.append(self.prompt_display)
+    
+    def update_prompt(self, current_dir):
+        """Update the prompt display, flashing in pink"""
+        now = time.monotonic()
+        if now - self.prompt_last_toggle > self.prompt_flash_interval:
+            self.prompt_visible = not self.prompt_visible
+            self.prompt_last_toggle = now
+
+        if self.prompt_visible:
+            self.prompt_display.text = f"{current_dir}{self.prompt}"
+            self.prompt_display.color = self.prompt_color
+        else:
+            self.prompt_display.text = ""  # Hide prompt
     
     def update_display(self, command=None, output=None):
         """Update the display with command and output"""
@@ -131,44 +231,47 @@ Connected via: {self.connection_type}
     def start(self, channel=None):
         """
         Start the command terminal
-        
+
         Args:
             channel: SSH channel object (if connecting via SSH)
         """
         self.channel = channel
-        
+
         # Print welcome message
         self.output(self.welcome_message)
-        
+
         # Main command loop
         while True:
             try:
-                # Show prompt
-                self.output(f"{self.current_dir}{self.prompt}", end="")
-                
+                # Show prompt (for display, flashing)
+                if self.display:
+                    self.update_prompt(self.current_dir)
+                else:
+                    self.output(f"{self.current_dir}{self.prompt}", end="")
+
                 # Get command
                 command = self.input()
-                
+
                 if not command:
                     continue
-                
+
                 # Add to history
                 if command and (not self.history or command != self.history[-1]):
                     self.history.append(command)
                     if len(self.history) > self.max_history:
                         self.history.pop(0)
                 self.history_index = len(self.history)
-                
+
                 # Process command
                 result = self.process_command(command)
-                
+
                 # Update display
                 self.update_display(command, result)
-                
+
                 # Check if we should exit
                 if result == "__EXIT__":
                     break
-                
+
             except Exception as e:
                 self.output(f"Error: {e}")
     
